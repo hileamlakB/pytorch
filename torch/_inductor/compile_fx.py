@@ -158,6 +158,46 @@ def compile_fx_inner(
     is_inference=False,
     boxed_forward_device_index=None,
 ):
+
+    print("inside compile_fx_inner")
+
+    # cound flip counter
+    # class MyInterpreter(torch.fx.Interpreter):
+    #     def __init__(self, mod):
+    #         super().__init__(mod, True)
+    #         from ..utils.flop_counter import FlopCounterMode
+    #         self.flop_counter = FlopCounterMode(mod, depth=1)
+
+    #     def run_node(self, n):
+    #         with self.flop_counter:
+    #             out = super().run_node(n)
+    #         return out
+    # MyInterpreter(gm).run(*example_inputs)
+    # from ..utils.flop_counter import FlopCounterMode
+    # flop_counter = FlopCounterMode(gm,
+    #                                depth=1)
+    # print('inside compile_fx_inner---------------------')
+    # interpreter = torch.fx.Interpreter(gm)
+    # with flop_counter:
+    #     interpreter.run(*example_inputs)
+    # print(gm.target)
+    # custom_mapping=custom_flop_maps.custom_mapping
+    # mod(inp).sum().backward()
+    # try:
+
+    #     with flop_counter:
+    #         mod(inp).sum().backward()
+    # except Exception as e:
+    #     pass
+    initial_graph = gm.graph
+    # print('---------------------GRAPH---------------------', gm.graph)
+    # for node in gm.graph.nodes:
+    #     print(node.target, node.args)
+    # exit()
+
+    # from pprint import pprint
+    # pprint(gm._graph.__dict__)
+
     if is_tf32_warning_applicable(gm):
         _warn_tf32_disabled()
 
@@ -295,6 +335,15 @@ def compile_fx_inner(
 
     # aot autograd needs to know to pass in inputs as a list
     result._boxed_call = True
+    # print("--------------RESULTS-----------------")
+    # print(result)
+
+    # if (graph != None and graph != initial_graph):
+    #     print("GRAPH VS INITIAL GRAPH")
+    #     print(graph)
+    #     print("INITIAL GRAPH")
+    #     print(initial_graph)
+    # print("Graph type:", type(graph), "Initial graph type:", type(initial_graph))
     return result
 
 

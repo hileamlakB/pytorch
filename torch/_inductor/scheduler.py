@@ -467,12 +467,15 @@ class FusedSchedulerNode(BaseSchedulerNode):
     its unmet dependencies as the union of its constituent nodes.
     """
 
-    @classmethod
-    def fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode):
-        assert node1.scheduler is node2.scheduler
-        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes())
+    VERTICAL_FUSION = 0
+    HORIZONTAL_FUSION = 1
 
-    def __init__(self, scheduler: "Scheduler", snodes: List[SchedulerNode]):
+    @classmethod
+    def fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode, fusion_type=VERTICAL_FUSION):
+        assert node1.scheduler is node2.scheduler
+        return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes(), fusion_type)
+
+    def __init__(self, scheduler: "Scheduler", snodes: List[SchedulerNode], fusion_type=VERTICAL_FUSION):
         # NB: No need to call super().__init__() because we don't need to re-use any of its logic.
         self.snodes = snodes
         self.scheduler = scheduler
@@ -498,6 +501,7 @@ class FusedSchedulerNode(BaseSchedulerNode):
         } - self.read_writes.writes
         self.min_order = min([x.min_order for x in self.snodes])
         self.max_order = max([x.max_order for x in self.snodes])
+        self.fusion_type = fusion_type
 
     @cache_on_self
     def get_name(self) -> str:
@@ -627,6 +631,7 @@ class Scheduler:
             *V.graph.graph_inputs.keys(),
             *V.graph.constants.keys(),
         }
+
         for node in nodes:
             assert (
                 node.origins is not None
@@ -866,10 +871,11 @@ class Scheduler:
         for node1, node2 in self.get_possible_fusions():
             node1 = self.name_to_fused_node[node1.get_first_name()]
             node2 = self.name_to_fused_node[node2.get_first_name()]
-            if self.can_fuse(node1, node2) and not self.will_fusion_create_cycle(
+            can_fuse_, fusion_type = self.can_fuse(node1, node2)
+            if can_fuse_ and not self.will_fusion_create_cycle(
                 node1, node2
             ):
-                node3 = FusedSchedulerNode.fuse(node1, node2)
+                node3 = FusedSchedulerNode.fuse(node1, node2, fusion_type)
                 fused_nodes.remove(node1)
                 fused_nodes.remove(node2)
                 fused_nodes.add(node3)
@@ -893,15 +899,15 @@ class Scheduler:
 
         def check_all_pairs(nodes):
             for node1_index, node1 in enumerate(nodes):
-                for node2 in nodes[node1_index + 1 :]:
+                for node2 in nodes[node1_index + 1:]:
                     key = (node1, node2)
                     if key in seen:
                         continue
                     seen.add(key)
 
-                    if self.can_fuse(node1, node2):
+                    if self.can_fuse(node1, node2)[0]:
                         possible_fusions.append(key)
-                    elif node2.is_template() and self.can_fuse(node2, node1):
+                    elif node2.is_template() and self.can_fuse(node2, node1)[0]:
                         # epilogue fusions are order dependent
                         possible_fusions.append((node2, node1))
 
@@ -948,48 +954,48 @@ class Scheduler:
         single fused node.
         """
         if node1 is node2:
-            return False
+            return (False, None)
         if (
             isinstance(node1, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
             and not node1.is_template()
         ):
-            return False
+            return (False, None)
         if (
             isinstance(node2, (ExternKernelSchedulerNode, NopKernelSchedulerNode))
             and not node2.is_template()
         ):
-            return False
+            return (False, None)
         if node2.get_names() & node1.recursive_predecessors:
-            return False  # node2 must go before node1
+            return (False, None)  # node2 must go before node1
         if node2.is_template():
-            return False  # only epilogues
+            return (False, None)  # only epilogues
         if node1.is_template() and (
             node2.has_aliasing_or_mutation()
             or node2.is_reduction()
             or not config.epilogue_fusion
         ):
-            return False
+            return (False, None)
 
         device = node1.get_device()
         if device != node2.get_device():
-            return False  # wrong device
+            return (False, None)  # wrong device
 
         no_shared_data = self.score_fusion_memory(node1, node2) == 0
         if no_shared_data and (
             not config.aggressive_fusion or node1.is_reduction() or node2.is_reduction()
         ):
-            return False  # heuristic not needed for correctness
+            return (False, None)  # heuristic not needed for correctness
 
         if len(node1.get_nodes()) + len(node2.get_nodes()) > config.max_fusion_size:
-            return False  # heuristic not needed for correctness
+            return (False, None)  # heuristic not needed for correctness
 
         if node1.get_names() & node2.recursive_predecessors:
             # node2 depends on node1 outputs
             if not self.can_fuse_vertical(node1, node2):
-                return False
-            return self.get_backend(device).can_fuse_vertical(node1, node2)
+                return (False, None)
+            return self.get_backend(device).can_fuse_vertical(node1, node2), FusedSchedulerNode.VERTICAL_FUSION
         else:  # nodes don't depend on each other, but may have common reads
-            return self.get_backend(device).can_fuse_horizontal(node1, node2)
+            return self.get_backend(device).can_fuse_horizontal(node1, node2), FusedSchedulerNode.HORIZONTAL_FUSION
 
     def can_fuse_vertical(self, node1, node2):
         """
@@ -1185,9 +1191,103 @@ class Scheduler:
             _, last = max(origins)
             V.graph.wrapper_code.enter_context(last)
 
+    def gather_fused_node_info(self):
+
+        from . import ir, dependencies as deps
+
+        def gather_node_info(node):
+
+            if isinstance(node, FusedSchedulerNode):
+                fused_info = {
+                    "names": node.get_names(),
+                    "device": node.get_device(),
+                    "fusion_type": node.fusion_type,
+                    "origins": [gather_node_info(n) for n in node.get_nodes()],
+                }
+                return fused_info
+
+            read_writes = node.read_writes
+            reads = ""
+            for read in read_writes.reads:
+                if isinstance(read, deps.MemoryDep):
+                    reads += f"{read.size};"
+
+            writes = ""
+            for write in read_writes.writes:
+                if isinstance(write, deps.MemoryDep):
+                    writes += f"{write.size};"
+
+            if isinstance(node.node, ir.ComputedBuffer):
+                layout = node.node.layout
+                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
+                input_sizes = layout.size
+                output_sizes = layout.size
+            elif isinstance(node.node, ir.ExternKernelAlloc):
+                layout = node.node.layout
+                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
+                input_sizes = layout.size
+                output_sizes = layout.size
+            elif isinstance(node.node, ir.ExternKernelOut):
+                layout = node.node.layout
+                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
+                input_sizes = layout.size
+                output_sizes = layout.size
+
+            else:
+                raise ValueError(f"Unsupported scheduler node type: {type(node.node)}")
+
+            from pprint import pprint
+            # pprint(node.node)
+
+            scheduler_node_info = {
+                "name": node.get_name(),
+                "input_sizes": input_sizes,
+                "output_sizes": output_sizes,
+                "output_type": output_type,
+                "reads": reads,
+                "writes": writes,
+                "origins": node.node.origins,
+            }
+            return scheduler_node_info
+
+        fused_node_info = []
+
+        for node in self.nodes:
+            info = gather_node_info(node)
+            fused_node_info.append(info)
+
+        return fused_node_info
+
     @dynamo_timed
     def codegen(self):
+
+        fused_nodes_info = self.gather_fused_node_info()
+        # print(fused_nodes_info)
+        # self.create_node_graph(filename="node_graph_spectral", layout_algorithm="spectral")
+        self.create_node_graph(filename="node_graph_linear", layout_algorithm="linear")
+        # self.create_node_graph(filename="node_graph_spring", layout_algorithm="spring")
+        self.create_node_graph(filename="node_graph_circular", layout_algorithm="circular")
+        # self.create_node_graph(filename="node_graph_kamada_kawai", layout_algorithm="kamada_kawai")
+
+        for i, node in enumerate(self.nodes):
+            # print("writing node", i, end=",")
+            with open(f"node_{i}", "w+") as f:
+                if isinstance(node, FusedSchedulerNode):
+                    for n in node.get_nodes():
+                        f.write(str(n.node))
+                        f.write("\n")
+                        f.write(str(n.read_writes))
+                        f.write("\n")
+                else:
+                    # print(node.read_writes)
+                    f.write(str(node.node))
+                    f.write("\n")
+                    f.write(str(node.read_writes))
+                    f.write("\n")
+                    # print(type(node.node))
+
         for node in self.nodes:
+            # print(node.log_details())
             self.enter_context(node)
             self.buffer_names_no_longer_needed.update(node.last_usage)
 
@@ -1230,3 +1330,99 @@ class Scheduler:
             self.available_buffer_names.update(node.get_names())
 
         self.flush()
+
+    def create_node_graph(self, filename="node_graph.png", layout_algorithm="spring"):
+
+        import networkx as nx
+        import matplotlib.patches as patches
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        def linear_layout(nodes, x_increment=5, y_value=0):
+            sorted_nodes = nodes
+            pos = {}
+            for i, node in enumerate(sorted_nodes):
+                pos[node] = np.array([i * x_increment, 0])
+            return pos
+
+        def draw_fused_subgraph(ax, node, pos):
+            internal_nodes = node.get_nodes()
+            internal_pos = {n.get_name(): pos[n.get_name()] for n in internal_nodes}
+            min_x = min(internal_pos.values(), key=lambda x: x[0])[0]
+            min_y = min(internal_pos.values(), key=lambda x: x[1])[1]
+            max_x = max(internal_pos.values(), key=lambda x: x[0])[0]
+            max_y = max(internal_pos.values(), key=lambda x: x[1])[1]
+
+            padding = 0.1
+            width = max_x - min_x + 2 * padding
+            height = max_y - min_y + 2 * padding if layout_algorithm != "linear" else 2
+
+            if node.fusion_type == FusedSchedulerNode.VERTICAL_FUSION:
+                rectangle = patches.Circle((min_x + width / 2, min_y + height / 2),
+                                           max(width, height) / 2, fill=False, edgecolor='green', linewidth=2)
+            else:
+                rectangle = patches.Rectangle((min_x - padding, min_y - padding), width,
+                                              height, fill=False, edgecolor='red', linewidth=2)
+
+            ax.add_patch(rectangle)
+
+        def add_nodes_recursive(G, node):
+            if isinstance(node, FusedSchedulerNode):
+                for n in node.get_nodes():
+                    add_nodes_recursive(G, n)
+            else:
+                G.add_node(node.get_name())
+
+        plt.figure(figsize=(100, 100))
+
+        # Create a directed graph
+        G = nx.DiGraph()
+
+        # Add nodes to the graph
+        for node in self.nodes:
+            add_nodes_recursive(G, node)
+
+        # Create edges between the nodes in the subgraphs (fused nodes)
+        for node in self.nodes:
+            if isinstance(node, FusedSchedulerNode):
+                nodes = node.get_nodes()
+                for node in nodes:
+                    G.add_node(node.get_name())
+            #     for i in range(len(nodes) - 1):
+            #         G.add_edge(nodes[i].get_name(), nodes[i + 1].get_name())
+            else:
+                G.add_node(node.get_name())
+
+        # Calculate positions
+            # Calculate positions based on the chosen layout algorithm
+        if layout_algorithm == 'spring':
+            pos = nx.spring_layout(G, k=2, iterations=400)
+        elif layout_algorithm == 'spectral':
+            pos = nx.spectral_layout(G)
+            scale_factor = 3.0
+            for node in pos:
+                pos[node] *= scale_factor
+        elif layout_algorithm == 'circular':
+            pos = nx.circular_layout(G)
+            scale_factor = 3.0
+            for node in pos:
+                pos[node] *= scale_factor
+        elif layout_algorithm == 'kamada_kawai':
+            pos = nx.kamada_kawai_layout(G)
+        elif layout_algorithm == 'linear':
+            pos = linear_layout(G.nodes())
+        else:
+            raise ValueError(
+                f"Invalid layout_algorithm: {layout_algorithm}. Choose one of ['spring', 'spectral', 'circular', 'kamada_kawai'].")
+
+        nx.draw(G, pos, with_labels=True, node_size=3000, node_color='skyblue',
+                font_size=10, font_weight='bold', arrows=True)
+
+        # Add the circle/squares around the fused nodes
+        ax = plt.gca()
+        for node in self.nodes:
+            if isinstance(node, FusedSchedulerNode):
+                draw_fused_subgraph(ax, node, pos)
+
+        plt.savefig(filename)
+        plt.clf()
