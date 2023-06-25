@@ -105,6 +105,12 @@ split_reductions = True
 # Only save random seed for backwards rather than full mask
 lowmem_dropout = True
 
+# Enable hile's debugging messages to be printed
+hilea_debug = False
+
+# Enable hilea's benchmark to benchmark externel kernels
+hilea_benchmark = False 
+
 benchmark_kernel = os.environ.get("TORCHINDUCTOR_BENCHMARK_KERNEL", "0") == "1"
 
 

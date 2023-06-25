@@ -2900,6 +2900,7 @@ class ExternKernelOut(ExternKernel):
 
 class ExternKernelAlloc(ExternKernel):
     def codegen(self, wrapper):
+        
         args = [*self.codegen_args(), *self.codegen_kwargs()]
         V.graph.wrapper_code.generate_extern_kernel_alloc(
             self.get_name(), self.kernel, args, self.get_origin_node()

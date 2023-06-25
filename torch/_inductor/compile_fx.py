@@ -159,21 +159,21 @@ def compile_fx_inner(
     boxed_forward_device_index=None,
 ):
 
-    print("inside compile_fx_inner")
+    # print("inside compile_fx_inner")
 
     # cound flip counter
     # class MyInterpreter(torch.fx.Interpreter):
     #     def __init__(self, mod):
     #         super().__init__(mod, True)
     #         from ..utils.flop_counter import FlopCounterMode
-    #         self.flop_counter = FlopCounterMode(mod, depth=1)
+    #         self.flop_counter = FlopCounterMode(depth=1)
 
     #     def run_node(self, n):
     #         with self.flop_counter:
     #             out = super().run_node(n)
     #         return out
     # MyInterpreter(gm).run(*example_inputs)
-    # from ..utils.flop_counter import FlopCounterMode
+    
     # flop_counter = FlopCounterMode(gm,
     #                                depth=1)
     # print('inside compile_fx_inner---------------------')
@@ -189,10 +189,24 @@ def compile_fx_inner(
     #         mod(inp).sum().backward()
     # except Exception as e:
     #     pass
-    initial_graph = gm.graph
+    #initial_graph = gm.graph
     # print('---------------------GRAPH---------------------', gm.graph)
+    
+    # HILEA update
+    # print nodes before schedulers are created
+    # this nodes will be inside the scheduler.nodes
+    aten = torch.ops.aten
+    
+    
+    # print("file_name: ", file_name, "line_number: ", line_number)
+    # print('---------------------GRAPH---------------------')
     # for node in gm.graph.nodes:
-    #     print(node.target, node.args)
+    #     # node.example_inputs = example_inputs
+    #     if isinstance(node.target, torch._ops.OpOverload):
+    #         print(node, node.op, node.target.overloadpacket, node.args, type(node))
+    #     else:
+    #         print(node, node.op, node.target, node.args, type(node))
+    # #print("total nodes": len(gm.graph.nodes))
     # exit()
 
     # from pprint import pprint

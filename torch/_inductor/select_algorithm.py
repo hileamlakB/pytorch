@@ -31,7 +31,7 @@ from .codegen.triton import (
     TritonScheduling,
 )
 
-from .utils import do_bench, sympy_dot, sympy_product
+from .utils import do_bench, get_num_bytes, sympy_dot, sympy_product
 from .virtualized import V
 
 log = logging.getLogger(__name__)
@@ -535,8 +535,32 @@ class ExternKernelChoice:
         self.name = name
         self.cpp_kernel = cpp_kernel
         self.ordered_kwargs_for_cpp_kernel = ordered_kwargs_for_cpp_kernel
+        
+        
+        # Hilea Updates
+        def benchmark_fn(*args, **kwargs):            
+            from torch.utils.flop_counter import FlopCounterMode
+            ms = do_bench(lambda: kernel(*args, **kwargs))
+            # print(kwargs)
+            # num_gb = get_num_bytes(*args, num_in_out_args={ninplace_args}) / 1e9
+            with FlopCounterMode(display=False) as mode:
+                kernel(*args, **kwargs)
+            from torch.utils.custom_benchmark import status
+            status["flops"] = mode.get_total_flops()
+            status["ms"] = ms
+            # print(f"{ms:.3f}ms    {mode.get_total_flops()}Flops")
+            # print(f"{ms:.3f}ms    {num_gb:.3f}GB    {gb_per_s:.2f}GB/s {mode.get_total_flops()}")
+            return kernel(*args, **kwargs)
+       
+        
         self.has_out_variant = has_out_variant
-        setattr(extern_kernels, name, kernel)
+        
+        if torch._inductor.config.hilea_benchmark:
+            setattr(extern_kernels, name, benchmark_fn)
+        else:
+            setattr(extern_kernels, name, kernel)
+        
+        
 
     def to_callable(self):
         return getattr(extern_kernels, self.name)

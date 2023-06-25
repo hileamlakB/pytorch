@@ -387,7 +387,7 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def floor(x):
         return f"tl.math.floor({x})"
-
+                                        
     @staticmethod
     def floordiv(a, b):
         # See the comment in lowering.div_mode. a and b are integer type.
@@ -1402,6 +1402,7 @@ class TritonKernel(Kernel):
                     f"return KERNEL_NAME.benchmark_all_configs(*args, {extra_args_str}grid=grid({', '.join(grid)}))"
                 )
 
+        print("ninplace_args", self.args.inplace_buffers)
         ninplace_args = len(unique(self.args.inplace_buffers.values()))
         result.writelines(["\n", "\n", "if __name__ == '__main__':"])
         with result.indent():
@@ -1418,7 +1419,7 @@ class TritonKernel(Kernel):
             )
             result.writeline("gb_per_s = num_gb / (ms / 1e3)")
             result.writeline(
-                'print(f"{ms:.3f}ms    {num_gb:.3f}GB    {gb_per_s:.2f}GB/s")'
+                'print(f"{ms:.3f}ms    {num_gb:.3f}GB    {gb_per_s:.2f}GB/s {ninplace_args}")'
             )
 
         return result
@@ -1645,6 +1646,10 @@ class TritonScheduling:
     def __init__(self, scheduler):
         self.scheduler = scheduler
 
+        # HILEA Updates
+        self.kernel_path = None
+        self.kernel_name = None
+
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
@@ -1735,7 +1740,7 @@ class TritonScheduling:
         def end_current_reduction_loop():
             if current_loop_writes:
                 # flush out any other runnable nodes to reduce number of loops
-                for other_node in nodes[index + 1 :]:
+                for other_node in nodes[index + 1:]:
                     if (
                         node not in done
                         and fits_in_main_body(other_node)
@@ -1927,7 +1932,12 @@ class TritonScheduling:
 
         self.scheduler.free_buffers()
 
+        # HILEA Update
+        self.kernel_name = kernel_name
+        self.kernel = kernel
+
     def define_kernel(self, src_code, node_schedule):
+        # print("Node schedule:", type(node_schedule), node_schedule)
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             kernel_name = wrapper.src_to_kernel[src_code]
@@ -1963,6 +1973,8 @@ class TritonScheduling:
             wrapper.define_kernel(
                 kernel_name, compile_wrapper.getvalue(), metadata_comment
             )
+            self.kernel_name = kernel_name
+            self.kernel_path = kernel_path
         return kernel_name
 
     def codegen_template(self, template_node, epilogue_nodes):

@@ -466,13 +466,24 @@ class FusedSchedulerNode(BaseSchedulerNode):
     that are meant to be fused together. The way it does this is by maintaining
     its unmet dependencies as the union of its constituent nodes.
     """
-
+    # HILE update
     VERTICAL_FUSION = 0
     HORIZONTAL_FUSION = 1
+    vertical_fussions = {}
 
     @classmethod
     def fuse(cls, node1: BaseSchedulerNode, node2: BaseSchedulerNode, fusion_type=VERTICAL_FUSION):
         assert node1.scheduler is node2.scheduler
+        # HILE update
+        # if Horizontal fusion is applied to already vertically fused nodes then we need to store the
+        # vertical fusion for later use
+        if fusion_type == cls.HORIZONTAL_FUSION:
+            # print("Found some horizontal fusion", node1.get_name(), node2.get_name())
+            if isinstance(node1, FusedSchedulerNode) and node1.fusion_type == cls.VERTICAL_FUSION:
+                cls.vertical_fussions[node1.get_name()] = node1.get_nodes()
+            if isinstance(node2, FusedSchedulerNode) and node2.fusion_type == cls.VERTICAL_FUSION:
+                cls.vertical_fussions[node2.get_name()] = node2.get_nodes()
+
         return cls(node1.scheduler, node1.get_nodes() + node2.get_nodes(), fusion_type)
 
     def __init__(self, scheduler: "Scheduler", snodes: List[SchedulerNode], fusion_type=VERTICAL_FUSION):
@@ -633,15 +644,22 @@ class Scheduler:
         }
 
         for node in nodes:
+            
             assert (
                 node.origins is not None
             ), "All nodes passed to scheduling must have an origin"
             if node.is_no_op():
                 self.nodes.append(NopKernelSchedulerNode(self, node))
             elif isinstance(node, (ir.ComputedBuffer, ir.TemplateBuffer)):
+                # origin_node = node.get_origin_node()
+                # if origin_node:
+                #     print(origin_node, origin_node.target)
+                # else:
+                #     print(origin_node, node)
                 group_fn = self.get_backend(node.get_device()).group_fn
                 self.nodes.append(SchedulerNode(self, node, group_fn))
             elif isinstance(node, ir.ExternKernel):
+                # print(node.get_origin_node())
                 self.nodes.append(ExternKernelSchedulerNode(self, node))
             else:
                 raise NotImplementedError(node)
@@ -684,6 +702,9 @@ class Scheduler:
         # fx graph node to the position it appears in the graph
         # for debug attribution
         self.origin_to_index = {}
+        # print("origin_to_index", self.origin_to_index)
+
+        # print(FusedSchedulerNode.vertical_fussions)
 
     def debug_draw_graph(self):
         """Generate an image of the graph for debugging"""
@@ -1142,8 +1163,10 @@ class Scheduler:
 
     def codegen_extern_call(self, scheduler_node: ExternKernelSchedulerNode):
         assert isinstance(scheduler_node, ExternKernelSchedulerNode)
+        
         scheduler_node.allocate()
         node = scheduler_node.node
+        # print(type(node))
         node.codegen(V.graph.wrapper_code)
         self.free_buffers()
 
@@ -1191,102 +1214,79 @@ class Scheduler:
             _, last = max(origins)
             V.graph.wrapper_code.enter_context(last)
 
-    def gather_fused_node_info(self):
-
-        from . import ir, dependencies as deps
-
-        def gather_node_info(node):
-
-            if isinstance(node, FusedSchedulerNode):
-                fused_info = {
-                    "names": node.get_names(),
-                    "device": node.get_device(),
-                    "fusion_type": node.fusion_type,
-                    "origins": [gather_node_info(n) for n in node.get_nodes()],
+    # HILEA update
+    def gather_node_info(self, node, kernel_name, kernel_path):
+        import json
+        from ..utils.custom_flop_counter import get_total_flop
+        
+        node_flops = get_total_flop(node.get_nodes())
+                 
+            
+        stats = {}
+        
+        stats["flops"] = node_flops
+        ops = []
+        for origin in [origin for n in node.get_nodes() for origin in n.node.origins]:
+            if isinstance(origin.target, torch._ops.OpOverload):
+                ops.append(str(origin.target.overloadpacket))
+        stats["ops"] = ops
+        
+        inputs = []
+        kwargs = []
+        for n in [n.node for n in node.get_nodes()]:
+            if isinstance(n, ir.ComputedBuffer):
+                # print([type(i) for i in n.layout.size])
+                props = {
+                    "dtype": str(n.layout.dtype),
+                    "size": [str(i) for i in n.layout.size],
+                    "stride": [str(i) for i in n.layout.stride],
                 }
-                return fused_info
-
-            read_writes = node.read_writes
-            reads = ""
-            for read in read_writes.reads:
-                if isinstance(read, deps.MemoryDep):
-                    reads += f"{read.size};"
-
-            writes = ""
-            for write in read_writes.writes:
-                if isinstance(write, deps.MemoryDep):
-                    writes += f"{write.size};"
-
-            if isinstance(node.node, ir.ComputedBuffer):
-                layout = node.node.layout
-                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
-                input_sizes = layout.size
-                output_sizes = layout.size
-            elif isinstance(node.node, ir.ExternKernelAlloc):
-                layout = node.node.layout
-                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
-                input_sizes = layout.size
-                output_sizes = layout.size
-            elif isinstance(node.node, ir.ExternKernelOut):
-                layout = node.node.layout
-                output_type = f"{layout.dtype}, {layout.size}, {layout.stride}"
-                input_sizes = layout.size
-                output_sizes = layout.size
-
+                inputs.append(props)
             else:
-                raise ValueError(f"Unsupported scheduler node type: {type(node.node)}")
+                if isinstance(n, ir.MultiOutput):
+                    continue
+                
+                assert n.is_extern()
+                inputs += [{ "dtype": str(in_.layout.dtype),
+                    "size": [str(i)  for i in in_.layout.size],
+                    "stride": [str(i) for i in in_.layout.stride],
+                } for in_ in n.inputs]
+                kwargs.append(n.kwargs)
+        
+        
+        stats["inputs"] = inputs
+        stats["kwargs"] = kwargs
+        stats["triton"] = {
+            "kernel_name": kernel_name,
+            "kernel_path": kernel_path,
+        }
+        
+            # write json to file
+        return stats
 
-            from pprint import pprint
-            # pprint(node.node)
-
-            scheduler_node_info = {
-                "name": node.get_name(),
-                "input_sizes": input_sizes,
-                "output_sizes": output_sizes,
-                "output_type": output_type,
-                "reads": reads,
-                "writes": writes,
-                "origins": node.node.origins,
-            }
-            return scheduler_node_info
-
-        fused_node_info = []
-
-        for node in self.nodes:
-            info = gather_node_info(node)
-            fused_node_info.append(info)
-
-        return fused_node_info
-
+    
     @dynamo_timed
     def codegen(self):
 
-        fused_nodes_info = self.gather_fused_node_info()
-        # print(fused_nodes_info)
-        # self.create_node_graph(filename="node_graph_spectral", layout_algorithm="spectral")
-        self.create_node_graph(filename="node_graph_linear", layout_algorithm="linear")
-        # self.create_node_graph(filename="node_graph_spring", layout_algorithm="spring")
-        self.create_node_graph(filename="node_graph_circular", layout_algorithm="circular")
-        # self.create_node_graph(filename="node_graph_kamada_kawai", layout_algorithm="kamada_kawai")
-
+        from ..utils.gpu_info import get_gpu_info
+        node_data = {"nodes":[], "gpu_info":get_gpu_info()}
+        
+        
+        if torch._inductor.config.hilea_debug:
+            for node in self.nodes:
+                for n in node.get_nodes():
+                    print("----------------file_name: scheduler, line_number: around 1277")
+                    print(n.node)
+                    print(n.read_writes)
+                    for origin in n.node.origins:
+                        import pprint
+                        pprint.pprint(origin.__dict__)
+                        print(origin)
+                    print("-------------------------")
+            
+        # HILEA upate
         for i, node in enumerate(self.nodes):
-            # print("writing node", i, end=",")
-            with open(f"node_{i}", "w+") as f:
-                if isinstance(node, FusedSchedulerNode):
-                    for n in node.get_nodes():
-                        f.write(str(n.node))
-                        f.write("\n")
-                        f.write(str(n.read_writes))
-                        f.write("\n")
-                else:
-                    # print(node.read_writes)
-                    f.write(str(node.node))
-                    f.write("\n")
-                    f.write(str(node.read_writes))
-                    f.write("\n")
-                    # print(type(node.node))
 
-        for node in self.nodes:
             # print(node.log_details())
             self.enter_context(node)
             self.buffer_names_no_longer_needed.update(node.last_usage)
@@ -1313,13 +1313,22 @@ class Scheduler:
 
             self.buffer_names_to_free.update(node.last_usage)
 
+            triton_info = {"kernel_name": "", "kernel_path": ""}
+            
+            
             if node.is_template():
                 node, *epilogue = node.get_nodes()
                 self.get_backend(device).codegen_template(node, epilogue)
             elif node.is_extern():
                 self.codegen_extern_call(node)
+                triton_info["kernel_name"] = str(list(node.node.origins)[0].target.overloadpacket)
             elif isinstance(node, (FusedSchedulerNode, SchedulerNode)):
-                self.get_backend(device).codegen_nodes(node.get_nodes())
+                triton_kernel = self.get_backend(device)
+                triton_kernel.codegen_nodes(node.get_nodes())  
+                triton_info["kernel_name"] = triton_kernel.kernel_name
+                triton_info["kernel_path"] = triton_kernel.kernel_path
+                # bench_mark_res = triton_kernel.kernel.codegen_kernel_benchmark()        
+                # print(bench_mark_res.getvalue())
             else:
                 assert isinstance(node, NopKernelSchedulerNode)
                 node.allocate()
@@ -1328,7 +1337,27 @@ class Scheduler:
                 self.get_backend(device).codegen_sync()
 
             self.available_buffer_names.update(node.get_names())
+            
+            node_str = self.gather_node_info(node, triton_info["kernel_name"], triton_info["kernel_path"])  
+            node_data["nodes"].append(node_str)
+        
+        def write_data(data):
+            from sympy.core.numbers import Integer, One
+            import json
 
+            class CustomEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, (Integer, One)):
+                        return str(obj)
+                    # Add additional checks for other types here...
+                    return super().default(obj)
+                
+            import time
+            import torch.utils.custom_benchmark as benchmark
+            with open(f"Data_{benchmark.filename}.json", "w") as f:
+                f.write(json.dumps(data, indent=4, cls=CustomEncoder))      
+            
+        write_data(node_data)
         self.flush()
 
     def create_node_graph(self, filename="node_graph.png", layout_algorithm="spring"):
@@ -1337,6 +1366,29 @@ class Scheduler:
         import matplotlib.patches as patches
         import matplotlib.pyplot as plt
         import numpy as np
+        import pygraphviz as gv
+
+        def sugiyama_layout(G):
+            # Create a new Graphviz graph
+            G_gv = gv.AGraph(directed=True)
+
+            # Add nodes and edges from the NetworkX graph
+            for node in G.nodes():
+                G_gv.add_node(node)
+
+            for edge in G.edges():
+                G_gv.add_edge(edge[0], edge[1])
+
+            # Apply the Sugiyama layout (dot layout) in Graphviz
+            G_gv.layout(prog='dot')
+
+            # Extract the positions from the Graphviz layout
+            pos = {}
+            for node in G.nodes():
+                gv_node = G_gv.get_node(node)
+                pos[node] = (float(gv_node.attr['pos'].split(',')[0]), float(gv_node.attr['pos'].split(',')[1]))
+
+            return pos
 
         def linear_layout(nodes, x_increment=5, y_value=0):
             sorted_nodes = nodes
@@ -1393,9 +1445,26 @@ class Scheduler:
             else:
                 G.add_node(node.get_name())
 
+        # create edges between the nodes
+        for node in self.nodes:
+            if isinstance(node, FusedSchedulerNode):
+                nodes = node.get_nodes()
+                for i in range(len(nodes) - 1):
+                    # get dependencies
+                    reads = nodes[i].read_writes.reads
+                    for read in reads:
+                        G.add_edge(read.name, nodes[i].get_name())
+            else:
+                # get dependencies
+                reads = node.read_writes.reads
+                for read in reads:
+                    G.add_edge(read.name, node.get_name())
+
         # Calculate positions
             # Calculate positions based on the chosen layout algorithm
-        if layout_algorithm == 'spring':
+        if layout_algorithm == 'sugiyama':
+            pos = sugiyama_layout(G)
+        elif layout_algorithm == 'spring':
             pos = nx.spring_layout(G, k=2, iterations=400)
         elif layout_algorithm == 'spectral':
             pos = nx.spectral_layout(G)

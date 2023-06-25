@@ -644,7 +644,9 @@ class GraphLowering(torch.fx.Interpreter):
         assert self.scheduler is not None  # mypy can't figure this out
         self.scheduler.codegen()
         assert self.wrapper_code is not None
-        return self.wrapper_code.generate()
+        res = self.wrapper_code.generate()
+        # print("inside codegen", res)
+        return res
 
     def count_bytes(self):
         from .scheduler import FusedSchedulerNode, NopKernelSchedulerNode, Scheduler
@@ -692,6 +694,15 @@ class GraphLowering(torch.fx.Interpreter):
         from .codecache import PyCodeCache
 
         code, linemap = self.codegen()
+
+        # print(type(code))
+        # HILE Update
+        import time
+        if config.hilea_debug:
+            # print(f"{self.name}_{time.time()}.py")
+            with open(f"{self.name}_{time.time()}.py", "w") as f:
+                f.write(code)
+
         mod = PyCodeCache.load(code, linemap=linemap)
 
         for name, value in self.constants.items():
